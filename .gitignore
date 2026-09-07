@@ -1,0 +1,6 @@
+node_modules
+dist
+.openfox
+credentials.json
+credentials.key
+settings.json
