@@ -3,10 +3,12 @@ import type { ProviderPluginRegistry, ProviderPreset } from 'openfox/provider'
 import { FileProviderCredentialStore } from './credentials/file-credential-store.js'
 import { OpenCodeGoAuthAdapter } from './auth/opencode-auth.js'
 import { OpenCodeGoTransportAdapter } from './transport/opencode-go.js'
+import { OpenCodeGoQuotaProvider } from './quota/opencode-go.js'
 import { PluginSettingsStore, DEFAULT_SETTINGS, type OpenCodeGoPluginSettings } from './settings.js'
 import { OpenCodeGoSyncManager, type LimitChangeDiff, type SyncManagerOptions } from './sync-manager.js'
 import './types.js'
 import './models.js'
+import './quota/contract.js'
 
 const opencodeGoPreset: ProviderPreset = {
   id: 'opencode-go',
@@ -25,6 +27,7 @@ const opencodeGoPreset: ProviderPreset = {
 
 export { OpenCodeGoAuthAdapter } from './auth/opencode-auth.js'
 export { OpenCodeGoTransportAdapter } from './transport/opencode-go.js'
+export { OpenCodeGoQuotaProvider, type OpenCodeGoQuotaProviderOptions } from './quota/opencode-go.js'
 export { OpenCodeGoSyncManager, type LimitChangeDiff, type SyncManagerOptions } from './sync-manager.js'
 export { PluginSettingsStore, DEFAULT_SETTINGS, type OpenCodeGoPluginSettings } from './settings.js'
 export { OPENCODE_GO_MODELS, buildGoModelsList, fetchLiveBoosts } from './models.js'
@@ -59,6 +62,14 @@ export async function register(registry: ProviderPluginRegistry): Promise<void> 
   registry.registerAuth(auth)
   registry.registerTransport(transport)
   registry.registerPreset(opencodeGoPreset)
+
+  if (typeof (registry as any).registerQuotaProvider === 'function') {
+    ;(registry as any).registerQuotaProvider(
+      new OpenCodeGoQuotaProvider(credentials, {
+        configDirectory: registry.runtime.configDirectory,
+      }),
+    )
+  }
 
   if (typeof (registry as any).registerSettings === 'function') {
     ;(registry as any).registerSettings({
