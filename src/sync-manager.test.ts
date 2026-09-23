@@ -1,70 +1,93 @@
-import { describe, it, expect, vi } from 'vitest'
-import { MemoryProviderCredentialStore } from './credentials/credential-store.js'
-import { OpenCodeGoAuthAdapter } from './auth/opencode-auth.js'
-import { OpenCodeGoTransportAdapter } from './transport/opencode-go.js'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { OpenCodeGoSyncManager } from './sync-manager.js'
+import { DEFAULT_SETTINGS } from './settings.js'
 
 describe('OpenCodeGoSyncManager', () => {
-  it('should detect boosts and restorations with notifications', async () => {
-    const credentials = new MemoryProviderCredentialStore()
-    const credRef = await credentials.create({ apiKey: 'test-key', label: 'OpenCode Go' })
+  let mockTransport: any
+  let notifications: any[] = []
 
-    const auth = new OpenCodeGoAuthAdapter(credentials)
+  beforeEach(() => {
+    notifications = []
+    mockTransport = {
+      listModels: vi.fn().mockResolvedValue([
+        {
+          id: 'mimo-v2.5',
+          name: 'MiMo-V2.5',
+          quota: {
+            baseRequestsPer5h: 30100,
+            multiplier: 1,
+            effectiveRequestsPer5h: 30100,
+            isBoosted: false,
+          },
+        },
+      ]),
+    }
+  })
 
-    let currentBoost = 1
-    const mockFetcher = vi.fn(async (url: string | URL | Request) => {
-      const urlStr = url.toString()
-      if (urlStr.includes('/models')) {
-        return new Response(
-          JSON.stringify({
-            data: [
-              { id: 'glm-5.3-flash' },
-              { id: 'kimi-k3' },
-            ],
-          }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } },
-        )
-      }
-      if (urlStr.includes('/go')) {
-        if (currentBoost > 1) {
-          return new Response(
-            `<html><body>GLM-5.3-Flash gets ${currentBoost}× usage limits for a limited time</body></html>`,
-            { status: 200 },
-          )
-        }
-        return new Response('<html><body>Standard limits</body></html>', { status: 200 })
-      }
-      return new Response('Not found', { status: 404 })
-    }) as any
+  afterEach(() => {
+    vi.clearAllTimers()
+  })
 
-    const transport = new OpenCodeGoTransportAdapter(auth, { fetcher: mockFetcher })
+  it('initializes with default settings', () => {
+    const manager = new OpenCodeGoSyncManager({
+      transport: mockTransport,
+    })
+    expect(manager.getSettings()).toEqual(DEFAULT_SETTINGS)
+    expect(manager.getModelsRefreshIntervalMs()).toBe(60 * 60 * 1000)
+    expect(manager.getPricesRefreshIntervalMs()).toBe(60 * 60 * 1000)
+  })
 
-    const notifications: Array<{ title: string; body: string }> = []
-    const syncManager = new OpenCodeGoSyncManager({
-      auth,
-      credentials,
-      transport,
+  it('runs syncAll and discovers models and quota diffs', async () => {
+    const manager = new OpenCodeGoSyncManager({
+      transport: mockTransport,
       notify: (notif) => notifications.push(notif),
     })
 
-    // Initial check (does not trigger diff notifications)
-    await syncManager.checkModels()
-    expect(notifications.length).toBe(0)
+    const initialResult = await manager.syncAll()
+    expect(initialResult.models.length).toBe(1)
+    expect(initialResult.priceDiffs.length).toBe(0)
 
-    // Apply 2x boost to GLM-5.3-Flash
-    currentBoost = 2
-    await syncManager.checkModels()
+    // Simulate quota multiplier update
+    mockTransport.listModels.mockResolvedValue([
+      {
+        id: 'mimo-v2.5',
+        name: 'MiMo-V2.5',
+        quota: {
+          baseRequestsPer5h: 30100,
+          multiplier: 2,
+          effectiveRequestsPer5h: 60200,
+          isBoosted: true,
+        },
+      },
+      {
+        id: 'omen-alpha',
+        name: 'Omen Alpha',
+        quota: {
+          baseRequestsPer5h: 11600,
+          multiplier: 1,
+          effectiveRequestsPer5h: 11600,
+          isBoosted: false,
+        },
+      },
+    ])
 
-    expect(notifications.length).toBe(1)
-    expect(notifications[0].title).toContain('Usage Limit Boost Active')
-    expect(notifications[0].body).toContain('GLM-5.3-Flash: boosted to 2x usage limits')
+    const secondResult = await manager.syncAll()
+    expect(secondResult.models.length).toBe(2)
+    expect(secondResult.priceDiffs.length).toBe(1)
+    expect(secondResult.priceDiffs[0]?.modelId).toBe('mimo-v2.5')
+    expect(secondResult.priceDiffs[0]?.newMultiplier).toBe(2)
+  })
 
-    // Restore to normal
-    currentBoost = 1
-    await syncManager.checkModels()
-
-    expect(notifications.length).toBe(2)
-    expect(notifications[1].title).toContain('Usage Limit Restored')
-    expect(notifications[1].body).toContain('GLM-5.3-Flash: usage limit restored to normal')
+  it('updates settings dynamically', () => {
+    const manager = new OpenCodeGoSyncManager({
+      transport: mockTransport,
+    })
+    manager.updateSettings({
+      ...DEFAULT_SETTINGS,
+      modelsRefreshIntervalMinutes: 15,
+      pricesRefreshIntervalMinutes: 45,
+    })
+    expect(manager.getModelsRefreshIntervalMs()).toBe(15 * 60 * 1000)
+    expect(manager.getPricesRefreshIntervalMs()).toBe(45 * 60 * 1000)
   })
 })

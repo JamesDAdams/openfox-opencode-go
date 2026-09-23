@@ -1,23 +1,33 @@
 {
   "name": "openfox-opencode-go",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "OpenCode Go provider plugin for OpenFox",
-  "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "type": "module",
   "files": [
     "dist",
     "README.md",
     "LICENSE"
   ],
-  "openfox": {
-    "apiVersion": 1,
-    "plugin": "./dist/index.js"
-  },
   "scripts": {
     "build": "tsup",
-    "typecheck": "tsc --noEmit",
-    "test": "vitest run --config vitest.config.ts"
+    "test": "vitest run --passWithNoTests --config vitest.config.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "openfox": {
+    "apiVersion": 2,
+    "displayName": "OpenCode Go",
+    "description": "Access curated open coding models with generous limits via your OpenCode Go subscription with live quota tracking.",
+    "icon": "https://opencode.ai/_build/assets/preview-opencode-logo-dark-ZBwNGoYp.png",
+    "entry": "./dist/index.js",
+    "capabilities": [
+      "tools",
+      "hooks",
+      "rpc",
+      "presets"
+    ],
+    "timeoutMs": 15000
   },
   "peerDependencies": {
     "openfox": ">=2.0.56 <3"

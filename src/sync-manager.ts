@@ -1,64 +1,86 @@
 import type { ModelConfig } from 'openfox/provider'
-import type { OpenCodeGoAuthAdapter } from './auth/opencode-auth.js'
-import type { ProviderCredentialStore } from './credentials/credential-store.js'
 import type { OpenCodeGoTransportAdapter } from './transport/opencode-go.js'
 import { DEFAULT_SETTINGS, type OpenCodeGoPluginSettings } from './settings.js'
 
-export interface SyncManagerOptions {
-  auth: OpenCodeGoAuthAdapter
-  credentials: ProviderCredentialStore
-  transport: OpenCodeGoTransportAdapter
-  notify?: (notification: { title: string; body: string }) => void
-  settings?: OpenCodeGoPluginSettings
-  modelsRefreshIntervalMs?: number
+export interface PriceDiff {
+  modelId: string
+  oldMultiplier?: number
+  newMultiplier?: number
+  oldQuota?: number
+  newQuota?: number
+  changes: string[]
 }
 
-export interface LimitChangeDiff {
-  modelId: string
-  modelName: string
-  previousMultiplier: number
-  newMultiplier: number
-  previousQuota: number
-  newQuota: number
-  type: 'boost' | 'restored' | 'changed'
-  description: string
+export interface SyncNotification {
+  title: string | { en: string; fr: string }
+  body?: string | { en: string; fr: string }
+  level?: 'info' | 'success' | 'warning' | 'error'
+}
+
+export interface SyncManagerOptions {
+  transport: OpenCodeGoTransportAdapter
+  settings?: OpenCodeGoPluginSettings
+  notify?: (notification: SyncNotification) => void
+  modelsRefreshIntervalMs?: number
+  pricesRefreshIntervalMs?: number
+}
+
+interface ModelQuotaMeta {
+  baseRequestsPer5h?: number
+  multiplier?: number
+  effectiveRequestsPer5h?: number
+  isBoosted?: boolean
+}
+
+type ModelWithQuota = ModelConfig & {
+  quota?: ModelQuotaMeta
+}
+
+export function formatPriceDiffBody(priceDiffs: PriceDiff[], maxModels = 2): string {
+  if (priceDiffs.length === 0) return ''
+
+  const formattedModels = priceDiffs.slice(0, maxModels).map((diff) => {
+    const detail = diff.changes.length > 0 ? diff.changes.join('\n') : '• Quota/Boost updated'
+    return `${diff.modelId}:\n${detail}`
+  })
+
+  const remaining = priceDiffs.length - maxModels
+  if (remaining > 0) {
+    return `${formattedModels.join('\n\n')}\n\n(+${remaining} other${remaining > 1 ? 's' : ''})`
+  }
+
+  return formattedModels.join('\n\n')
 }
 
 export class OpenCodeGoSyncManager {
-  private readonly auth: OpenCodeGoAuthAdapter
-  private readonly credentials: ProviderCredentialStore
   private readonly transport: OpenCodeGoTransportAdapter
-  private notifier?: (notification: { title: string; body: string }) => void
+  private notifier?: (notification: SyncNotification) => void
   private settings: OpenCodeGoPluginSettings
 
   private customModelsIntervalMs?: number
-  private modelsTimer: NodeJS.Timeout | null = null
+  private customPricesIntervalMs?: number
 
-  private knownModels = new Map<
-    string,
-    {
-      name: string
-      baseQuota: number
-      multiplier: number
-      effectiveQuota: number
-    }
-  >()
-  private isInitialLoad = true
+  private modelsTimer: NodeJS.Timeout | null = null
+  private pricesTimer: NodeJS.Timeout | null = null
+
+  private knownModelIds = new Set<string>()
+  private knownModelQuotas = new Map<string, ModelQuotaMeta>()
+  private isInitialModelsLoad = true
+  private isInitialPricesLoad = true
 
   private lastDiscoveredModels: string[] = []
   private lastRemovedModels: string[] = []
-  private lastLimitChanges: LimitChangeDiff[] = []
+  private lastPriceDiffs: PriceDiff[] = []
 
   constructor(options: SyncManagerOptions) {
-    this.auth = options.auth
-    this.credentials = options.credentials
     this.transport = options.transport
     this.notifier = options.notify
     this.settings = options.settings ?? { ...DEFAULT_SETTINGS }
     this.customModelsIntervalMs = options.modelsRefreshIntervalMs
+    this.customPricesIntervalMs = options.pricesRefreshIntervalMs
   }
 
-  setNotifier(notify: (notification: { title: string; body: string }) => void): void {
+  setNotifier(notify: (notification: SyncNotification) => void): void {
     this.notifier = notify
   }
 
@@ -74,8 +96,8 @@ export class OpenCodeGoSyncManager {
     return [...this.lastRemovedModels]
   }
 
-  getLastLimitChanges(): LimitChangeDiff[] {
-    return [...this.lastLimitChanges]
+  getLastPriceDiffs(): PriceDiff[] {
+    return [...this.lastPriceDiffs]
   }
 
   getModelsRefreshIntervalMs(): number {
@@ -84,18 +106,46 @@ export class OpenCodeGoSyncManager {
     return minutes * 60 * 1000
   }
 
-  updateSettings(settings: OpenCodeGoPluginSettings): void {
-    const prevInterval = this.getModelsRefreshIntervalMs()
-    this.settings = { ...settings }
-    const newInterval = this.getModelsRefreshIntervalMs()
+  getPricesRefreshIntervalMs(): number {
+    if (this.customPricesIntervalMs !== undefined) return this.customPricesIntervalMs
+    const minutes = this.settings.pricesRefreshIntervalMinutes || DEFAULT_SETTINGS.pricesRefreshIntervalMinutes
+    return minutes * 60 * 1000
+  }
 
-    if (this.modelsTimer && prevInterval !== newInterval) {
-      this.stop()
-      this.start(false)
+  updateSettings(settings: OpenCodeGoPluginSettings): void {
+    const prevModelsInterval = this.getModelsRefreshIntervalMs()
+    const prevPricesInterval = this.getPricesRefreshIntervalMs()
+    this.settings = { ...settings }
+    const newModelsInterval = this.getModelsRefreshIntervalMs()
+    const newPricesInterval = this.getPricesRefreshIntervalMs()
+
+    if (this.modelsTimer && prevModelsInterval !== newModelsInterval) {
+      this.stopModelsSync()
+      this.startModelsSync(false)
+    }
+
+    if (this.pricesTimer && prevPricesInterval !== newPricesInterval) {
+      this.stopPricesSync()
+      this.startPricesSync(false)
     }
   }
 
-  start(checkOnStart = this.settings.checkModelsOnStartup): void {
+  start(): void {
+    this.startModelsSync(this.settings.checkModelsOnStartup)
+    this.startPricesSync(this.settings.checkPricesOnStartup)
+  }
+
+  stop(): void {
+    this.stopModelsSync()
+    this.stopPricesSync()
+  }
+
+  restart(): void {
+    this.stop()
+    this.start()
+  }
+
+  startModelsSync(checkOnStart = this.settings.checkModelsOnStartup): void {
     if (this.modelsTimer) return
     if (checkOnStart) {
       this.checkModels(false, false).catch(() => {})
@@ -106,189 +156,108 @@ export class OpenCodeGoSyncManager {
     if (this.modelsTimer.unref) this.modelsTimer.unref()
   }
 
-  stop(): void {
+  stopModelsSync(): void {
     if (this.modelsTimer) {
       clearInterval(this.modelsTimer)
       this.modelsTimer = null
     }
   }
 
-  private async getFirstValidCredentialRef(): Promise<string | undefined> {
-    const references = await this.credentials.listReferences()
-    for (const ref of references) {
-      const status = await this.auth.getStatus({ providerId: 'opencode-go', credentialRef: ref })
-      if (status.state === 'connected') {
-        return ref
-      }
+  startPricesSync(checkOnStart = this.settings.checkPricesOnStartup): void {
+    if (this.pricesTimer) return
+    if (checkOnStart) {
+      this.checkPrices(false, false).catch(() => {})
     }
-    return references[0]
+    this.pricesTimer = setInterval(() => {
+      this.checkPrices(false, false).catch(() => {})
+    }, this.getPricesRefreshIntervalMs())
+    if (this.pricesTimer.unref) this.pricesTimer.unref()
   }
 
-  async checkModels(force = false, isManual = false): Promise<ModelConfig[]> {
+  stopPricesSync(): void {
+    if (this.pricesTimer) {
+      clearInterval(this.pricesTimer)
+      this.pricesTimer = null
+    }
+  }
+
+  async checkModels(_force = false, isManual = false): Promise<ModelConfig[]> {
     try {
-      const credRef = await this.getFirstValidCredentialRef()
-
-      const models = await this.transport.listModels({
+      const dummyContext = {
         providerId: 'opencode-go',
-        credentialRef: credRef,
-      })
-
-      const currentModelMap = new Map<string, ModelConfig>()
-      for (const m of models) {
-        currentModelMap.set(m.id, m)
+        signal: new AbortController().signal,
+        model: 'mimo-v2.5',
       }
-
+      const models = (await this.transport.listModels(dummyContext as any)) as ModelWithQuota[]
+      const currentModelIds = new Set(models.map((m) => m.id))
       const newModels: string[] = []
       const removedModels: string[] = []
-      const limitChanges: LimitChangeDiff[] = []
 
-      // Check for added models or limit changes
       for (const m of models) {
-        const quotaData = (m as any).quota as
-          | {
-              baseRequestsPer5h: number
-              multiplier: number
-              effectiveRequestsPer5h: number
-              isBoosted: boolean
-            }
-          | undefined
+        if (!this.knownModelIds.has(m.id)) {
+          newModels.push(m.name || m.id)
+        }
+      }
 
-        const multiplier = quotaData?.multiplier ?? 1
-        const effectiveQuota = quotaData?.effectiveRequestsPer5h ?? quotaData?.baseRequestsPer5h ?? 0
-        const baseQuota = quotaData?.baseRequestsPer5h ?? 0
-        const modelName = m.name?.replace(/\s*\([^)]*Boost\)/, '') || m.id
-
-        if (!this.knownModels.has(m.id)) {
-          newModels.push(modelName)
-        } else if (!this.isInitialLoad) {
-          const prev = this.knownModels.get(m.id)!
-          if (prev.multiplier !== multiplier || prev.effectiveQuota !== effectiveQuota) {
-            let changeType: LimitChangeDiff['type'] = 'changed'
-            let desc = ''
-
-            if (multiplier > prev.multiplier && multiplier > 1) {
-              changeType = 'boost'
-              desc = `${modelName}: boosted to ${multiplier}x usage limits (${effectiveQuota.toLocaleString()} req/5h)`
-            } else if (multiplier < prev.multiplier && multiplier === 1) {
-              changeType = 'restored'
-              desc = `${modelName}: usage limit restored to normal (${effectiveQuota.toLocaleString()} req/5h)`
-            } else {
-              desc = `${modelName}: limit changed from ${prev.effectiveQuota.toLocaleString()} to ${effectiveQuota.toLocaleString()} req/5h`
-            }
-
-            limitChanges.push({
-              modelId: m.id,
-              modelName,
-              previousMultiplier: prev.multiplier,
-              newMultiplier: multiplier,
-              previousQuota: prev.effectiveQuota,
-              newQuota: effectiveQuota,
-              type: changeType,
-              description: desc,
-            })
+      if (!this.isInitialModelsLoad) {
+        for (const id of this.knownModelIds) {
+          if (!currentModelIds.has(id)) {
+            removedModels.push(id)
           }
         }
       }
 
-      // Check for removed models
-      if (!this.isInitialLoad) {
-        for (const [id, prev] of this.knownModels.entries()) {
-          if (!currentModelMap.has(id)) {
-            removedModels.push(prev.name)
-          }
-        }
-      }
-
-      const wasInitial = this.isInitialLoad
+      const wasInitial = this.isInitialModelsLoad
       this.lastDiscoveredModels = newModels
       this.lastRemovedModels = removedModels
-      this.lastLimitChanges = limitChanges
-
-      // Update known models state
-      this.knownModels.clear()
-      for (const m of models) {
-        const quotaData = (m as any).quota as
-          | {
-              baseRequestsPer5h: number
-              multiplier: number
-              effectiveRequestsPer5h: number
-            }
-          | undefined
-
-        const modelName = m.name?.replace(/\s*\([^)]*Boost\)/, '') || m.id
-        this.knownModels.set(m.id, {
-          name: modelName,
-          baseQuota: quotaData?.baseRequestsPer5h ?? 0,
-          multiplier: quotaData?.multiplier ?? 1,
-          effectiveQuota: quotaData?.effectiveRequestsPer5h ?? quotaData?.baseRequestsPer5h ?? 0,
-        })
+      if (models.length > 0) {
+        this.knownModelIds = currentModelIds
       }
-      this.isInitialLoad = false
+      this.isInitialModelsLoad = false
 
       if (this.notifier) {
-        const notificationsToSend: Array<{ title: string; body: string }> = []
-
-        // Model additions/removals
-        if (!wasInitial && (newModels.length > 0 || removedModels.length > 0)) {
-          const parts: string[] = []
-          if (newModels.length > 0) parts.push(`Added: ${newModels.join(', ')}`)
-          if (removedModels.length > 0) parts.push(`Removed: ${removedModels.join(', ')}`)
-
-          if (this.settings.notifyOnNewModelsOnly || this.settings.notifyOnEveryCheck) {
-            notificationsToSend.push({
-              title: 'OpenCode Go: Model Catalog Update',
-              body: parts.join('\n'),
-            })
-          }
+        const changes: string[] = []
+        if (newModels.length > 0) {
+          changes.push(`New models (${newModels.length}): ${newModels.join(', ')}`)
         }
-
-        // Limit / boost changes
-        if (!wasInitial && limitChanges.length > 0) {
-          const boostChanges = limitChanges.filter((c) => c.type === 'boost')
-          const restoredChanges = limitChanges.filter((c) => c.type === 'restored')
-          const otherChanges = limitChanges.filter((c) => c.type === 'changed')
-
-          if (this.settings.notifyOnLimitChanges || this.settings.notifyOnEveryCheck) {
-            if (boostChanges.length > 0) {
-              notificationsToSend.push({
-                title: 'OpenCode Go: Usage Limit Boost Active',
-                body: boostChanges.map((b) => `🚀 ${b.description}`).join('\n'),
-              })
-            }
-            if (restoredChanges.length > 0) {
-              notificationsToSend.push({
-                title: 'OpenCode Go: Usage Limit Restored',
-                body: restoredChanges.map((r) => `ℹ️ ${r.description}`).join('\n'),
-              })
-            }
-            if (otherChanges.length > 0) {
-              notificationsToSend.push({
-                title: 'OpenCode Go: Usage Limits Updated',
-                body: otherChanges.map((o) => `• ${o.description}`).join('\n'),
-              })
-            }
-          }
+        if (removedModels.length > 0) {
+          changes.push(`Removed models (${removedModels.length}): ${removedModels.join(', ')}`)
         }
 
         if (isManual) {
-          const summaryParts: string[] = [`${models.length} Go models available`]
-          if (newModels.length > 0) summaryParts.push(`${newModels.length} new`)
-          if (removedModels.length > 0) summaryParts.push(`${removedModels.length} removed`)
-          if (limitChanges.length > 0) summaryParts.push(`${limitChanges.length} limit updates`)
-
-          notificationsToSend.push({
-            title: 'OpenCode Go Sync Complete',
-            body: summaryParts.join(' | '),
+          this.notifier({
+            title: { en: 'OpenCode Go Models Synced', fr: 'Modèles OpenCode Go synchronisés' },
+            body:
+              changes.length > 0
+                ? {
+                    en: `Sync complete: ${models.length} models available (${changes.join(' | ')}).`,
+                    fr: `Synchronisation terminée : ${models.length} modèles disponibles (${changes.join(' | ')}).`,
+                  }
+                : {
+                    en: `Sync complete: ${models.length} models available (no changes).`,
+                    fr: `Synchronisation terminée : ${models.length} modèles disponibles (aucun changement).`,
+                  },
+            level: 'success',
           })
-        } else if (this.settings.notifyOnEveryCheck && notificationsToSend.length === 0) {
-          notificationsToSend.push({
-            title: 'OpenCode Go Check Complete',
-            body: `${models.length} Go models up to date (no changes).`,
+        } else if (
+          !wasInitial &&
+          changes.length > 0 &&
+          (this.settings.notifyOnNewModelsOnly || this.settings.notifyOnEveryCheck)
+        ) {
+          this.notifier({
+            title: { en: 'OpenCode Go: New Models Available', fr: 'OpenCode Go : Nouveaux modèles disponibles' },
+            body: { en: changes.join('\n'), fr: changes.join('\n') },
+            level: 'info',
           })
-        }
-
-        for (const notif of notificationsToSend) {
-          this.notifier(notif)
+        } else if (this.settings.notifyOnEveryCheck && (!wasInitial || changes.length === 0)) {
+          this.notifier({
+            title: { en: 'OpenCode Go Models Checked', fr: 'Modèles OpenCode Go vérifiés' },
+            body: {
+              en: `Check complete: ${models.length} models available (no changes).`,
+              fr: `Vérification terminée : ${models.length} modèles disponibles (aucun changement).`,
+            },
+            level: 'info',
+          })
         }
       }
 
@@ -296,26 +265,115 @@ export class OpenCodeGoSyncManager {
     } catch (err) {
       if (isManual && this.notifier) {
         this.notifier({
-          title: 'OpenCode Go Sync Error',
-          body: err instanceof Error ? err.message : 'Error syncing models',
+          title: { en: 'OpenCode Go Models Sync Error', fr: 'Erreur de synchronisation des modèles OpenCode Go' },
+          body: {
+            en: err instanceof Error ? err.message : 'Error syncing models',
+            fr: err instanceof Error ? err.message : 'Erreur lors de la synchronisation des modèles',
+          },
+          level: 'error',
         })
       }
       return []
     }
   }
 
-  async syncAll(): Promise<{
-    models: ModelConfig[]
-    boosts: LimitChangeDiff[]
-    added: string[]
-    removed: string[]
-  }> {
-    const models = await this.checkModels(true, true)
-    return {
-      models,
-      boosts: this.getLastLimitChanges(),
-      added: this.getLastDiscoveredModels(),
-      removed: this.getLastRemovedModels(),
+  async checkPrices(_force = false, isManual = false): Promise<PriceDiff[]> {
+    try {
+      const dummyContext = {
+        providerId: 'opencode-go',
+        signal: new AbortController().signal,
+        model: 'mimo-v2.5',
+      }
+      const models = (await this.transport.listModels(dummyContext as any)) as ModelWithQuota[]
+      const priceDiffs: PriceDiff[] = []
+
+      for (const m of models) {
+        const currentQuota = m.quota
+        if (!currentQuota) continue
+
+        const known = this.knownModelQuotas.get(m.id)
+        if (known) {
+          const changes: string[] = []
+          if (known.multiplier !== currentQuota.multiplier) {
+            changes.push(`Boost multiplier: ${known.multiplier ?? 1}x → ${currentQuota.multiplier ?? 1}x`)
+          }
+          if (known.effectiveRequestsPer5h !== currentQuota.effectiveRequestsPer5h) {
+            changes.push(
+              `Effective rate limit: ${known.effectiveRequestsPer5h ?? 'N/A'} → ${currentQuota.effectiveRequestsPer5h ?? 'N/A'} req/5h`,
+            )
+          }
+
+          if (changes.length > 0) {
+            priceDiffs.push({
+              modelId: m.id,
+              oldMultiplier: known.multiplier,
+              newMultiplier: currentQuota.multiplier,
+              oldQuota: known.effectiveRequestsPer5h,
+              newQuota: currentQuota.effectiveRequestsPer5h,
+              changes,
+            })
+          }
+        }
+
+        this.knownModelQuotas.set(m.id, { ...currentQuota })
+      }
+
+      this.lastPriceDiffs = priceDiffs
+      this.isInitialPricesLoad = false
+
+      if (this.notifier) {
+        if (priceDiffs.length > 0) {
+          const body = formatPriceDiffBody(priceDiffs)
+          if (isManual || this.settings.notifyOnPriceChanges || this.settings.notifyOnEveryCheck) {
+            this.notifier({
+              title: { en: 'OpenCode Go Quota & Boosts Updated', fr: 'Quotas et boosts OpenCode Go mis à jour' },
+              body: {
+                en: `Pricing/limit changes detected for ${priceDiffs.length} model(s):\n${body}`,
+                fr: `Changements de limites/prix détectés pour ${priceDiffs.length} modèle(s) :\n${body}`,
+              },
+              level: 'info',
+            })
+          }
+        } else if (isManual) {
+          this.notifier({
+            title: { en: 'OpenCode Go Pricing Checked', fr: 'Prix OpenCode Go vérifiés' },
+            body: {
+              en: 'All model prices and quotas are up-to-date (no changes).',
+              fr: 'Tous les prix et quotas des modèles sont à jour (aucun changement).',
+            },
+            level: 'info',
+          })
+        } else if (this.settings.notifyOnEveryCheck) {
+          this.notifier({
+            title: { en: 'OpenCode Go Pricing Checked', fr: 'Prix OpenCode Go vérifiés' },
+            body: {
+              en: 'All model prices and quotas are up-to-date (no changes).',
+              fr: 'Tous les prix et quotas des modèles sont à jour (aucun changement).',
+            },
+            level: 'info',
+          })
+        }
+      }
+
+      return priceDiffs
+    } catch (err) {
+      if (isManual && this.notifier) {
+        this.notifier({
+          title: { en: 'OpenCode Go Pricing Sync Error', fr: 'Erreur de synchronisation des prix OpenCode Go' },
+          body: {
+            en: err instanceof Error ? err.message : 'Error checking API prices/quotas',
+            fr: err instanceof Error ? err.message : 'Erreur lors de la vérification des prix/quotas',
+          },
+          level: 'error',
+        })
+      }
+      return []
     }
+  }
+
+  async syncAll(): Promise<{ models: ModelConfig[]; priceDiffs: PriceDiff[] }> {
+    const models = await this.checkModels(true, true)
+    const priceDiffs = await this.checkPrices(true, false)
+    return { models, priceDiffs }
   }
 }
