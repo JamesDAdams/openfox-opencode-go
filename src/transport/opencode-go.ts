@@ -14,9 +14,12 @@ import type {
 } from 'openfox/provider'
 import type { OpenCodeGoAuthAdapter } from '../auth/opencode-auth.js'
 import {
-  OPENCODE_GO_MODELS_MAP,
+  type OpenCodeGoModelMeta,
+  OPENCODE_GO_MODELS,
+  ModelsCacheStore,
   buildGoModelsList,
-  fetchLiveBoosts,
+  fetchLiveModelsAndBoosts,
+  inferEndpoint,
 } from '../models.js'
 
 const OPENCODE_GO_BASE_URL = 'https://opencode.ai/zen/go/v1'
@@ -41,13 +44,21 @@ export class OpenCodeGoTransportAdapter implements ProviderTransportAdapter {
   private cachedModels: ModelConfig[] = []
   private readonly fetcher: typeof fetch
   private readonly configDirectory?: string
+  private readonly cacheStore: ModelsCacheStore
+  private knownMetaMap = new Map<string, OpenCodeGoModelMeta>()
 
   constructor(
     private readonly auth?: OpenCodeGoAuthAdapter,
-    options: { fetcher?: typeof fetch; configDirectory?: string } = {},
+    options: { fetcher?: typeof fetch; configDirectory?: string; cacheFilePath?: string } = {},
   ) {
     this.fetcher = options.fetcher ?? fetch
     this.configDirectory = options.configDirectory
+    const cachePath =
+      options.cacheFilePath ||
+      (options.configDirectory
+        ? join(options.configDirectory, 'plugins', 'openfox-opencode-go', 'models-cache.json')
+        : undefined)
+    this.cacheStore = new ModelsCacheStore(cachePath)
   }
 
   async resolveApiKey(context?: ProviderRequestContext): Promise<string | undefined> {
@@ -71,50 +82,51 @@ export class OpenCodeGoTransportAdapter implements ProviderTransportAdapter {
     return process.env.OPENCODE_GO_API_KEY || process.env.OPENCODE_API_KEY
   }
 
-  async listModels(context: ProviderRequestContext): Promise<ModelConfig[]> {
+  async listModels(context?: ProviderRequestContext): Promise<ModelConfig[]> {
     try {
       const apiKey = await this.resolveApiKey(context)
-      const headers: Record<string, string> = {
-        'User-Agent': 'OpenFox',
-      }
-      if (apiKey) {
-        headers['Authorization'] = `Bearer ${apiKey}`
-      }
+      const { models: modelMetas, boosts } = await fetchLiveModelsAndBoosts(this.fetcher, {
+        apiKey,
+        cacheStore: this.cacheStore,
+      })
 
-      let availableIds: Set<string> | undefined
-      try {
-        const res = await this.fetcher(`${OPENCODE_GO_BASE_URL}/models`, {
-          headers,
-          signal: AbortSignal.timeout(5000),
-        })
-
-        if (res.ok) {
-          const json = (await res.json()) as { data?: Array<{ id: string }> } | Array<{ id: string }>
-          const list = Array.isArray(json) ? json : json.data
-          if (Array.isArray(list)) {
-            availableIds = new Set(list.map((m) => m.id))
-          }
+      if (modelMetas.length > 0) {
+        for (const meta of modelMetas) {
+          this.knownMetaMap.set(meta.id, meta)
         }
-      } catch {
-        // Fallback to static catalog if network call fails
-      }
-
-      const boosts = await fetchLiveBoosts(this.fetcher)
-      const models = buildGoModelsList(availableIds, boosts)
-
-      if (models.length > 0) {
-        this.cachedModels = models
-        return models
+        const modelConfigs = buildGoModelsList(modelMetas, undefined, boosts)
+        this.cachedModels = modelConfigs
+        return modelConfigs
       }
     } catch {
-      // Fallback
+      // Network call failed, attempt cache fallback
     }
+
+    // Try loading from disk cache
+    try {
+      const cached = await this.cacheStore.load()
+      if (cached?.models && cached.models.length > 0) {
+        for (const meta of cached.models) {
+          this.knownMetaMap.set(meta.id, meta)
+        }
+        const boosts = new Map<string, number>()
+        if (cached.boosts) {
+          for (const [k, v] of Object.entries(cached.boosts)) {
+            boosts.set(k, v)
+          }
+        }
+        const modelConfigs = buildGoModelsList(cached.models, undefined, boosts)
+        this.cachedModels = modelConfigs
+        return modelConfigs
+      }
+    } catch {}
 
     if (this.cachedModels.length > 0) {
       return this.cachedModels
     }
 
-    return buildGoModelsList()
+    // Fallback seed list
+    return buildGoModelsList(OPENCODE_GO_MODELS)
   }
 
   async complete(request: LLMCompletionRequest, context: ProviderRequestContext): Promise<LLMCompletionResponse> {
@@ -144,8 +156,8 @@ export class OpenCodeGoTransportAdapter implements ProviderTransportAdapter {
     }
 
     const model = context.model || 'qwen3.8-flash'
-    const meta = OPENCODE_GO_MODELS_MAP.get(model)
-    const endpoint = meta?.endpoint || '/chat/completions'
+    const meta = this.knownMetaMap.get(model)
+    const endpoint = meta?.endpoint || inferEndpoint(model)
 
     try {
       if (endpoint === '/messages') {

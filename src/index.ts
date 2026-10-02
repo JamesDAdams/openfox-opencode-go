@@ -32,7 +32,15 @@ export {
   type OpenCodeGoQuotaProviderOptions,
   type OpenCodeProviderAccount,
 } from './quota/opencode-go.js'
-export { OPENCODE_GO_MODELS, buildGoModelsList, fetchLiveBoosts } from './models.js'
+export {
+  OPENCODE_GO_MODELS,
+  buildGoModelsList,
+  fetchLiveBoosts,
+  fetchLiveModelsAndBoosts,
+  parseModelsFromHtml,
+  parseBoostsFromHtml,
+  ModelsCacheStore,
+} from './models.js'
 export { PluginSettingsStore, DEFAULT_SETTINGS, type OpenCodeGoPluginSettings } from './settings.js'
 export { OpenCodeGoSyncManager, type PriceDiff, type SyncManagerOptions } from './sync-manager.js'
 
@@ -49,6 +57,7 @@ export async function register(registry: ProviderPluginRegistry): Promise<void> 
   const auth = new OpenCodeGoAuthAdapter(credentials)
   const transport = new OpenCodeGoTransportAdapter(auth, {
     configDirectory: configDir,
+    cacheFilePath: join(storageDir, 'models-cache.json'),
   })
 
   const notify =

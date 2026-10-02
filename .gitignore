@@ -6,4 +6,5 @@ dist/
 credentials.json
 credentials.key
 settings.json
+models-cache.json
 .env

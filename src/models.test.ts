@@ -1,8 +1,14 @@
 import { describe, it, expect } from 'vitest'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import {
   OPENCODE_GO_MODELS,
+  ModelsCacheStore,
   buildGoModelsList,
   parseBoostsFromHtml,
+  parseModelsFromHtml,
+  fetchLiveModelsAndBoosts,
 } from './models.js'
 
 describe('OpenCode Go Models & Quotas', () => {
@@ -82,8 +88,6 @@ describe('OpenCode Go Models & Quotas', () => {
   })
 
   it('should re-order models dynamically when a boost is applied', () => {
-    // GLM-5.3-Flash base quota is 1580.
-    // With 2x boost = 3160, which should place it above kimi-k2.7-code (1350) and hy4-preview (1350)
     const boosts = new Map([['glm-5.3-flash', 2]])
     const list = buildGoModelsList(undefined, boosts)
 
@@ -94,5 +98,128 @@ describe('OpenCode Go Models & Quotas', () => {
     expect((list[glmIndex] as any).quota.effectiveRequestsPer5h).toBe(3160)
     expect((list[glmIndex] as any).quota.isBoosted).toBe(true)
     expect(list[glmIndex].name).toContain('(2x Boost)')
+  })
+
+  it('should parse models and unlimited/free quotas from HTML table', () => {
+    const html = `
+      <table>
+        <tbody>
+          <tr>
+            <th scope="row"><bdi>LongCat 2.5 Preview Free</bdi></th>
+            <td data-slot="bars"></td>
+            <td data-slot="number"><span>∞</span><span>∞</span></td>
+          </tr>
+          <tr>
+            <th scope="row"><bdi>MiMo-V2.6-Flash</bdi></th>
+            <td data-slot="bars"></td>
+            <td data-slot="number"><span>30,100</span><span>60,200</span></td>
+          </tr>
+        </tbody>
+      </table>
+    `
+    const models = parseModelsFromHtml(html)
+    expect(models.has('longcat-2.5-preview-free')).toBe(true)
+    expect(models.get('longcat-2.5-preview-free')?.name).toBe('LongCat 2.5 Preview Free')
+    expect(models.get('longcat-2.5-preview-free')?.baseRequestsPer5h).toBe(100000)
+
+    expect(models.has('mimo-v2.6-flash')).toBe(true)
+    expect(models.get('mimo-v2.6-flash')?.baseRequestsPer5h).toBe(30100)
+  })
+
+  it('should save and load models cache to/from disk', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'models-cache-test-'))
+    const cachePath = join(dir, 'models-cache.json')
+    const store = new ModelsCacheStore(cachePath)
+
+    const initial = await store.load()
+    expect(initial).toBeNull()
+
+    const data = {
+      models: [
+        {
+          id: 'longcat-2.5-preview-free',
+          name: 'LongCat 2.5 Preview Free',
+          contextWindow: 1000000,
+          endpoint: '/chat/completions' as const,
+          baseRequestsPer5h: 100000,
+        },
+      ],
+      boosts: { 'longcat-2.5-preview-free': 1 },
+      updatedAt: Date.now(),
+    }
+
+    await store.save(data)
+    const reloaded = await store.load()
+    expect(reloaded).not.toBeNull()
+    expect(reloaded?.models).toHaveLength(1)
+    expect(reloaded?.models[0]?.id).toBe('longcat-2.5-preview-free')
+    expect(reloaded?.models[0]?.name).toBe('LongCat 2.5 Preview Free')
+
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('should fetch live models and persist to cache, including unlisted new models', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'models-live-test-'))
+    const cachePath = join(dir, 'models-cache.json')
+    const store = new ModelsCacheStore(cachePath)
+
+    const mockFetcher = async (url: string | URL | Request) => {
+      const urlStr = url.toString()
+      if (urlStr.includes('/models')) {
+        return new Response(
+          JSON.stringify({
+            data: [
+              { id: 'space-bunny-free' },
+              { id: 'longcat-2.5-preview-free' },
+              { id: 'new-unlisted-model-v1' },
+            ],
+          }),
+          { status: 200 },
+        )
+      }
+      if (urlStr.includes('/go')) {
+        return new Response(
+          `
+            <table>
+              <tr>
+                <th scope="row"><bdi>LongCat 2.5 Preview Free</bdi></th>
+                <td data-slot="number"><span>∞</span></td>
+              </tr>
+            </table>
+            <p>Space-Bunny-Free gets 2x usage limits</p>
+          `,
+          { status: 200 },
+        )
+      }
+      return new Response('', { status: 404 })
+    }
+
+    const { models } = await fetchLiveModelsAndBoosts(mockFetcher as any, {
+      cacheStore: store,
+    })
+
+    expect(models.length).toBe(3)
+    const modelIds = models.map((m) => m.id)
+    expect(modelIds).toContain('space-bunny-free')
+    expect(modelIds).toContain('longcat-2.5-preview-free')
+    expect(modelIds).toContain('new-unlisted-model-v1')
+
+    const longcat = models.find((m) => m.id === 'longcat-2.5-preview-free')
+    expect(longcat?.name).toBe('LongCat 2.5 Preview Free')
+    expect(longcat?.baseRequestsPer5h).toBe(100000)
+
+    // Verify cache file was written to disk
+    const diskCache = await store.load()
+    expect(diskCache?.models.length).toBe(3)
+    expect(diskCache?.boosts?.['space-bunny-free']).toBe(2)
+
+    // Test fallback when offline
+    const failingFetcher = async () => new Response('', { status: 500 })
+    const offlineResult = await fetchLiveModelsAndBoosts(failingFetcher as any, {
+      cacheStore: store,
+    })
+    expect(offlineResult.models.length).toBe(3)
+
+    await rm(dir, { recursive: true, force: true })
   })
 })
