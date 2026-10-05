@@ -1,6 +1,6 @@
 {
   "name": "openfox-opencode-go",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "OpenCode Go provider plugin for OpenFox",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -33,10 +33,11 @@
     "openfox": ">=2.0.56 <3"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.19.15",
     "tsup": "^8.4.0",
     "typescript": "^5.7.3",
-    "vitest": "^4.1.2"
+    "vitest": "^3.0.0"
   },
   "license": "MIT"
 }
