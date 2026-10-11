@@ -74,6 +74,11 @@ src/
 - `models-cache.json` is a generated file (models cache), do not edit.
 - `better-sqlite3.d.ts` is a type declaration file, do not edit.
 - The quota contract (`src/quota/contract.ts`) is shared across provider plugins.
+- The transport receives host-resolved messages: for vision-capable models the
+  image data URL stays on `msg.attachments`, and this adapter is responsible for
+  serializing it into each protocol's multimodal shape (handled in the helpers
+  at the top of `src/transport/opencode-go.ts`). Non-image attachments are
+  already inlined into `content` by the host.
 - Multi-protocol: automatic routing between `/chat/completions`, `/messages` (Anthropic), `/responses` (OpenAI).
 
 ## Do Not Read / Do Not Touch
