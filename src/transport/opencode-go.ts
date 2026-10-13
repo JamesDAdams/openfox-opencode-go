@@ -26,6 +26,61 @@ const OPENCODE_GO_BASE_URL = 'https://opencode.ai/zen/go/v1'
 
 const LOOKAROUND_RE = /\(\?[=!]|\(\?<[=!]/
 
+function isImageAttachment(attachment: { mimeType: string }): boolean {
+  return attachment.mimeType.startsWith('image/')
+}
+
+/**
+ * Images carrying a base64 data URL, ready to be sent on the wire. The host
+ * resolves attachments before handing messages to the transport: for
+ * vision-capable models the image data URL stays on `attachments`, and this
+ * adapter is responsible for serializing it into the API-specific multimodal
+ * shape. Non-image attachments are left to the host, which inlines them as
+ * text in `content`.
+ */
+function imageDataUrls(message: LLMMessage): string[] {
+  return (message.attachments ?? []).filter(isImageAttachment).map((attachment) => attachment.data)
+}
+
+function parseImageDataUrl(dataUrl: string): { mediaType: string; data: string } | undefined {
+  const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/)
+  const mediaType = match?.[1]
+  const data = match?.[2]
+  if (!mediaType || !data) return undefined
+  return { mediaType, data }
+}
+
+function toChatCompletionsContent(message: LLMMessage): string | null | Array<Record<string, unknown>> {
+  const images = imageDataUrls(message)
+  if (images.length === 0) return message.content === '' ? null : message.content
+  const parts: Array<Record<string, unknown>> = []
+  if (message.content?.trim()) parts.push({ type: 'text', text: message.content })
+  for (const url of images) parts.push({ type: 'image_url', image_url: { url } })
+  return parts
+}
+
+function toAnthropicContent(message: LLMMessage): string | Array<Record<string, unknown>> {
+  const images = imageDataUrls(message)
+  if (images.length === 0) return message.content || ''
+  const blocks: Array<Record<string, unknown>> = []
+  if (message.content?.trim()) blocks.push({ type: 'text', text: message.content })
+  for (const url of images) {
+    const parsed = parseImageDataUrl(url)
+    if (!parsed) continue
+    blocks.push({ type: 'image', source: { type: 'base64', media_type: parsed.mediaType, data: parsed.data } })
+  }
+  return blocks.length > 0 ? blocks : message.content || ''
+}
+
+function toResponsesContent(message: LLMMessage): string | Array<Record<string, unknown>> {
+  const images = imageDataUrls(message)
+  if (images.length === 0) return message.content === '' ? '' : message.content
+  const parts: Array<Record<string, unknown>> = []
+  if (message.content?.trim()) parts.push({ type: 'input_text', text: message.content })
+  for (const url of images) parts.push({ type: 'input_image', image_url: url })
+  return parts
+}
+
 function sanitizeSchema(obj: unknown): unknown {
   if (Array.isArray(obj)) return obj.map(sanitizeSchema)
   if (obj && typeof obj === 'object') {
@@ -184,7 +239,7 @@ export class OpenCodeGoTransportAdapter implements ProviderTransportAdapter {
     const convertMessage = (m: LLMMessage) => {
       const base: Record<string, unknown> = {
         role: m.role,
-        content: m.content === '' ? null : m.content,
+        content: m.role === 'user' ? toChatCompletionsContent(m) : m.content === '' ? null : m.content,
       }
       if (m.role === 'assistant' && m.toolCalls?.length) {
         base.tool_calls = m.toolCalls.map((tc) => ({
@@ -434,7 +489,7 @@ export class OpenCodeGoTransportAdapter implements ProviderTransportAdapter {
       } else {
         anthropicMessages.push({
           role: 'user',
-          content: m.content || '',
+          content: toAnthropicContent(m),
         })
       }
     }
@@ -616,7 +671,7 @@ export class OpenCodeGoTransportAdapter implements ProviderTransportAdapter {
           content: `[Tool result for ${(m.toolCallId || '').slice(0, 64)}]: ${m.content || ''}`,
         })
       } else {
-        const msg: any = { role: m.role, content: m.content === '' ? '' : m.content }
+        const msg: any = { role: m.role, content: m.role === 'user' ? toResponsesContent(m) : m.content === '' ? '' : m.content }
         if (m.name) msg.name = m.name
         input.push(msg)
       }

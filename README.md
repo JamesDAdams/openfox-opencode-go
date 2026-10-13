@@ -11,6 +11,7 @@ Access curated open coding models with generous limits via your OpenCode Go subs
 - **Temporary Usage Boosts Detection:** Automatically detects and applies temporary usage limit boosts (such as 2x usage promos) and re-sorts models dynamically.
 - **Notifications:** In-app notifications when models are added, removed, when usage limits receive a temporary boost, or when limits return to normal.
 - **Multi-protocol Transport:** Automatically routes requests across `/chat/completions`, `/messages` (Anthropic format), and `/responses` (OpenAI format).
+- **Vision input:** Image attachments (pasted screenshots, image files) are serialized into each protocol's multimodal shape (`image_url` parts on chat completions, `image` blocks on the Anthropic messages API, `input_image` parts on the Responses API) for models that advertise vision support.
 
 ## Setup & Authentication
 

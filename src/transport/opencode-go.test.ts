@@ -126,4 +126,101 @@ describe('OpenCodeGoTransportAdapter', () => {
     expect(response.usage?.promptTokens).toBe(12)
     expect(response.usage?.completionTokens).toBe(8)
   })
+
+  describe('multimodal image attachments', () => {
+    const imageDataUrl = 'data:image/png;base64,AAAA'
+    const imageAttachment = {
+      id: 'img-1',
+      filename: 'shot.png',
+      mimeType: 'image/png',
+      size: 100,
+      data: imageDataUrl,
+    }
+
+    async function captureBody(model: string, messages: any[]) {
+      const credentials = new MemoryProviderCredentialStore()
+      const credRef = await credentials.create({ apiKey: 'key-123' })
+      const auth = new OpenCodeGoAuthAdapter(credentials)
+
+      let captured: any
+      const mockFetcher = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        captured = JSON.parse(String(init?.body))
+        const stream = new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'))
+            controller.close()
+          },
+        })
+        return new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+      }) as any
+
+      const transport = new OpenCodeGoTransportAdapter(auth, { fetcher: mockFetcher })
+      await transport.complete({ messages }, { providerId: 'opencode-go', credentialRef: credRef, model })
+      return captured
+    }
+
+    it('serializes an image into an image_url part on /chat/completions', async () => {
+      const body = await captureBody('deepseek-v4-flash', [
+        { role: 'user', content: 'look', attachments: [imageAttachment] },
+      ])
+
+      expect(body.messages[0]).toEqual({
+        role: 'user',
+        content: [
+          { type: 'text', text: 'look' },
+          { type: 'image_url', image_url: { url: imageDataUrl } },
+        ],
+      })
+    })
+
+    it('serializes an image into an Anthropic image block on /messages', async () => {
+      const body = await captureBody('qwen3.8-flash', [
+        { role: 'user', content: 'look', attachments: [imageAttachment] },
+      ])
+
+      expect(body.messages[0]).toEqual({
+        role: 'user',
+        content: [
+          { type: 'text', text: 'look' },
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA' } },
+        ],
+      })
+    })
+
+    it('serializes an image into an input_image part on /responses', async () => {
+      const body = await captureBody('grok-4.6', [
+        { role: 'user', content: 'look', attachments: [imageAttachment] },
+      ])
+
+      expect(body.input[0]).toEqual({
+        role: 'user',
+        content: [
+          { type: 'input_text', text: 'look' },
+          { type: 'input_image', image_url: imageDataUrl },
+        ],
+      })
+    })
+
+    it('keeps a plain string content when there are no attachments', async () => {
+      for (const model of ['deepseek-v4-flash', 'qwen3.8-flash', 'grok-4.6']) {
+        const body = await captureBody(model, [{ role: 'user', content: 'hello' }])
+        const list = body.messages ?? body.input
+        expect(list[0]).toEqual({ role: 'user', content: 'hello' })
+      }
+    })
+
+    it('does not turn non-image attachments into image parts', async () => {
+      const body = await captureBody('deepseek-v4-flash', [
+        {
+          role: 'user',
+          content: 'notes',
+          attachments: [
+            { id: 't1', filename: 'a.txt', mimeType: 'text/plain', size: 3, data: 'hi!' },
+          ],
+        },
+      ])
+
+      expect(typeof body.messages[0].content).toBe('string')
+    })
+  })
 })
